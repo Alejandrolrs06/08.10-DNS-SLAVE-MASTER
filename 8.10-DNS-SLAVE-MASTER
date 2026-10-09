@@ -1,0 +1,434 @@
+# Configuración DNS maestro y esclavo con BIND9
+
+<text>Práctica de ASIX · Debian · Administración de servicios de red</text>
+
+Configuración de una infraestructura DNS formada por dos servidores Debian que utilizan BIND9. El servidor maestro administra los registros de las zonas, mientras que el servidor esclavo obtiene y mantiene una copia mediante transferencias DNS.
+
+## Índice
+
+- [1. Objetivos](#1-objetivos)
+- [2. Topología de red](#2-topología-de-red)
+- [3. Instalación de BIND9](#3-instalación-de-bind9)
+- [4. Configuración del servidor maestro](#4-configuración-del-servidor-maestro)
+- [5. Configuración del servidor esclavo](#5-configuración-del-servidor-esclavo)
+- [6. Comprobaciones](#6-comprobaciones)
+- [7. Prueba de replicación](#7-prueba-de-replicación)
+- [8. Incidencias y soluciones](#8-incidencias-y-soluciones)
+- [9. Comandos de diagnóstico](#9-comandos-de-diagnóstico)
+- [10. Conclusiones](#10-conclusiones)
+- [11. Referencias](#11-referencias)
+
+---
+
+## 1. Objetivos
+
+Los objetivos de esta práctica son:
+
+- Crear zonas DNS de resolución directa e inversa.
+- Configurar un servidor maestro y otro esclavo con BIND9.
+- Permitir las transferencias de zona mediante AXFR.
+- Comprobar que ambos servidores ofrecen información coherente.
+- Verificar la actualización de los registros mediante el número de serie (*serial*).
+
+## 2. Topología de red
+
+La infraestructura está formada por dos máquinas Debian conectadas mediante una red interna.
+
+| Parámetro | Servidor maestro | Servidor esclavo |
+|---|---|---|
+| Nombre del equipo | `alejandro` | `dns2.alejandro.org` |
+| Dirección IP | `192.168.6.100/24` | `192.168.6.101/24` |
+| Interfaz interna | `enp0s8` | `enp0s8` |
+| Función | Maestro | Esclavo |
+
+### Parámetros DNS
+
+| Parámetro | Valor |
+|---|---|
+| Zona directa | `haven.local` |
+| Zona inversa | `6.168.192.in-addr.arpa` |
+| Red interna | `192.168.6.0/24` |
+| DNS reenviadores | `1.1.1.1` y `9.9.9.9` |
+| Sistema operativo | Debian |
+| Servicio | BIND9 |
+
+Ambas máquinas disponen de una interfaz adicional, `enp0s3`, conectada mediante NAT para permitir el acceso a Internet. En el entorno descrito, esta interfaz utiliza la dirección `10.0.2.15/24`.
+
+## 3. Instalación de BIND9
+
+Instala el servicio DNS y las herramientas de diagnóstico en ambos servidores:
+
+```bash
+sudo apt update
+sudo apt install bind9 bind9utils dnsutils -y
+```
+
+Durante la práctica, `ufw` está desactivado. Si el cortafuegos está activo, hay que permitir el tráfico DNS por los puertos **53 TCP y UDP** entre los dos servidores.
+
+---
+
+## 4. Configuración del servidor maestro
+
+El maestro utiliza la dirección `192.168.6.100` y almacena los archivos originales de las zonas DNS.
+
+### 4.1. Opciones generales
+
+Edita el archivo `/etc/bind/named.conf.options`:
+
+```conf
+acl "safeclients" {
+    localhost;
+    192.168.6.100;
+    localnets;
+};
+
+options {
+    directory "/var/cache/bind";
+
+    recursion yes;
+    allow-recursion { safeclients; };
+
+    listen-on { 192.168.6.100; };
+
+    allow-transfer { 192.168.6.101; };
+
+    allow-query { safeclients; };
+    allow-query-cache { safeclients; };
+
+    forwarders {
+        1.1.1.1;
+        9.9.9.9;
+    };
+};
+```
+
+La directiva `allow-transfer` autoriza las transferencias de zona desde el servidor maestro hacia el esclavo `192.168.6.101`.
+
+### 4.2. Declaración de las zonas
+
+Edita `/etc/bind/named.conf.local`:
+
+```conf
+zone "haven.local" {
+    type master;
+    file "/etc/bind/zones/db.haven.local";
+};
+
+zone "6.168.192.in-addr.arpa" {
+    type master;
+    file "/etc/bind/zones/db.6.168.192";
+};
+```
+
+Crea el directorio para almacenar los archivos de zona:
+
+```bash
+sudo mkdir -p /etc/bind/zones
+```
+
+### 4.3. Zona de resolución directa
+
+Crea el archivo `/etc/bind/zones/db.haven.local`:
+
+```dns
+$TTL 604800
+@       IN      SOA     haven.local. hostmaster.haven.local. (
+                        3       ; Serial
+                        12h     ; Refresh
+                        15m     ; Retry
+                        3w      ; Expire
+                        2h      ; Negative TTL
+)
+
+@       IN      NS      ns.haven.local.
+@       IN      NS      ns2.haven.local.
+
+ns      IN      A       192.168.6.100
+ns2     IN      A       192.168.6.101
+```
+
+Esta zona relaciona los nombres de los servidores DNS con sus direcciones IPv4.
+
+### 4.4. Zona de resolución inversa
+
+Crea el archivo `/etc/bind/zones/db.6.168.192`:
+
+```dns
+$TTL 604800
+@       IN      SOA     haven.local. hostmaster.haven.local. (
+                        3       ; Serial
+                        12h     ; Refresh
+                        15m     ; Retry
+                        3w      ; Expire
+                        2h      ; Negative TTL
+)
+
+@       IN      NS      ns.haven.local.
+@       IN      NS      ns2.haven.local.
+
+100     IN      PTR     ns.haven.local.
+101     IN      PTR     ns2.haven.local.
+```
+
+Los registros `PTR` permiten resolver las direcciones IP hacia sus nombres DNS.
+
+### 4.5. Validación de la configuración
+
+Comprueba que los archivos no contienen errores:
+
+```bash
+sudo named-checkconf
+sudo named-checkzone haven.local /etc/bind/zones/db.haven.local
+sudo named-checkzone 6.168.192.in-addr.arpa /etc/bind/zones/db.6.168.192
+sudo rndc reload
+```
+
+Si las comprobaciones son correctas, las zonas estarán preparadas para ser servidas por el maestro.
+
+---
+
+## 5. Configuración del servidor esclavo
+
+El esclavo utiliza la dirección `192.168.6.101` y obtiene las zonas del maestro.
+
+### 5.1. Configuración de red
+
+Edita `/etc/network/interfaces` en el servidor esclavo:
+
+```text
+auto enp0s8
+iface enp0s8 inet static
+    address 192.168.6.101/24
+```
+
+Aplica los cambios y comprueba las interfaces:
+
+```bash
+sudo systemctl restart networking
+ip -br addr
+```
+
+La interfaz `enp0s8` debe disponer de la dirección `192.168.6.101/24`.
+
+### 5.2. Opciones generales de BIND9
+
+Edita `/etc/bind/named.conf.options`:
+
+```conf
+acl "safeclients" {
+    localhost;
+    192.168.6.101;
+    localnets;
+};
+
+options {
+    directory "/var/cache/bind";
+
+    recursion yes;
+    allow-recursion { safeclients; };
+
+    listen-on { 192.168.6.101; };
+
+    allow-query { safeclients; };
+    allow-query-cache { safeclients; };
+
+    forwarders {
+        1.1.1.1;
+        9.9.9.9;
+    };
+
+    dnssec-validation no;
+};
+```
+
+Esta configuración establece la dirección de escucha y los servidores DNS externos que se utilizarán como reenviadores.
+
+### 5.3. Declaración de las zonas esclavas
+
+Edita `/etc/bind/named.conf.local`:
+
+```conf
+zone "haven.local" {
+    type slave;
+    masters { 192.168.6.100; };
+    file "/var/cache/bind/db.haven.local";
+};
+
+zone "6.168.192.in-addr.arpa" {
+    type slave;
+    masters { 192.168.6.100; };
+    file "/var/cache/bind/db.6.168.192";
+};
+```
+
+La directiva `masters` indica desde qué servidor se obtienen los datos originales.
+
+Los archivos de las zonas esclavas se guardan en `/var/cache/bind/`, donde BIND9 puede escribir los datos recibidos. No es necesario crearlos manualmente.
+
+### 5.4. Reinicio y comprobación del servicio
+
+Valida la configuración y reinicia BIND9:
+
+```bash
+sudo named-checkconf
+sudo systemctl restart named
+sudo systemctl status named --no-pager
+```
+
+El servicio debe aparecer activo y sin errores de configuración.
+
+---
+
+## 6. Comprobaciones
+
+Una vez configurados los dos servidores, realiza las siguientes pruebas.
+
+### 6.1. Verificar el puerto DNS
+
+En el servidor esclavo:
+
+```bash
+sudo ss -tulpn | grep ':53'
+```
+
+Comprueba que BIND9 está escuchando en la dirección `192.168.6.101` mediante TCP y UDP.
+
+### 6.2. Comprobar los archivos recibidos
+
+Ejecuta en el servidor esclavo:
+
+```bash
+ls -l /var/cache/bind/
+```
+
+Deben aparecer los archivos correspondientes a las zonas transferidas:
+
+- `db.haven.local`
+- `db.6.168.192`
+
+### 6.3. Comparar los registros SOA
+
+Consulta el registro SOA desde ambos servidores:
+
+```bash
+dig @192.168.6.100 haven.local SOA +short
+dig @192.168.6.101 haven.local SOA +short
+```
+
+Ambas respuestas deben mostrar el mismo número de serie cuando el esclavo está actualizado.
+
+Ejemplo de respuesta:
+
+```text
+haven.local. hostmaster.haven.local. 3 43200 900 1814400 7200
+```
+
+### 6.4. Verificar la resolución inversa
+
+Consulta el nombre asociado a la dirección IP del esclavo:
+
+```bash
+dig @192.168.6.101 -x 192.168.6.101 +short
+```
+
+Respuesta esperada:
+
+```text
+ns2.haven.local.
+```
+
+### 6.5. Consultar los registros de BIND9
+
+Para revisar los últimos mensajes del servicio:
+
+```bash
+sudo journalctl -u named -n 20 --no-pager
+```
+
+Los registros pueden mostrar mensajes similares a estos cuando las transferencias se completan correctamente:
+
+```text
+zone haven.local/IN: transferred serial 3
+zone 6.168.192.in-addr.arpa/IN: transferred serial 3
+transfer of 'haven.local/IN' from 192.168.6.100#53: Transfer status: success
+transfer of '6.168.192.in-addr.arpa/IN' from 192.168.6.100#53: Transfer status: success
+```
+
+---
+
+## 7. Prueba de replicación
+
+Para comprobar que los cambios se propagan automáticamente, modifica la zona directa en el servidor maestro.
+
+Añade el siguiente registro al archivo `/etc/bind/zones/db.haven.local`:
+
+```dns
+web     IN      A       192.168.6.120
+```
+
+Incrementa el número de serie de `3` a `4`:
+
+```dns
+4       ; Serial
+```
+
+Valida la zona y recarga el servicio:
+
+```bash
+sudo named-checkzone haven.local /etc/bind/zones/db.haven.local
+sudo rndc reload
+```
+
+Después, consulta el registro desde el servidor esclavo:
+
+```bash
+dig @192.168.6.101 web.haven.local A +short
+```
+
+La respuesta esperada es:
+
+```text
+192.168.6.120
+```
+
+La actualización puede tardar unos instantes. Si el registro no aparece, revisa los mensajes del servicio y el estado de la transferencia.
+
+---
+
+## 8. Incidencias y soluciones
+
+| Incidencia | Posible causa | Solución |
+|---|---|---|
+| `connection refused` durante una transferencia | Dirección IP incorrecta o servicio sin escucha en la interfaz esperada | Revisar `listen-on`, las direcciones IP y el estado de BIND9 |
+| Error `file format mismatch (not raw)` | Problemas con el formato o la ruta de almacenamiento de la zona esclava | Revisar la ruta configurada en `named.conf.local` y los registros del servicio |
+| Registro NS incorrecto | Nombre DNS incompleto o mal escrito | Utilizar el nombre completo, como `ns.haven.local.` |
+| El esclavo no recibe los cambios | El maestro no permite la transferencia o el serial no se ha incrementado | Revisar `allow-transfer`, `masters` y el número de serie |
+
+---
+
+## 9. Comandos de diagnóstico
+
+| Comando | Función |
+|---|---|
+| `sudo named-checkconf` | Valida la sintaxis de la configuración |
+| `sudo named-checkzone <zona> <archivo>` | Comprueba un archivo de zona |
+| `sudo rndc reload` | Recarga la configuración |
+| `sudo rndc retransfer haven.local` | Solicita una nueva transferencia de la zona en el esclavo |
+| `sudo journalctl -u named -n 30 --no-pager` | Consulta los últimos mensajes del servicio |
+| `sudo ss -tulpn \| grep ':53'` | Comprueba los procesos que escuchan en el puerto 53 |
+| `dig @<ip> <zona> AXFR` | Solicita una transferencia completa de zona |
+
+---
+
+## 10. Conclusiones
+
+La práctica permite configurar un servicio DNS redundante mediante un servidor maestro y otro esclavo utilizando BIND9 sobre Debian.
+
+Se han definido las zonas directa e inversa, establecido las transferencias entre los servidores y preparado pruebas para comprobar la resolución de nombres y la sincronización de los registros.
+
+La comparación de los registros SOA y la prueba de modificación de una zona permiten verificar el mecanismo de actualización entre ambos servidores.
+
+## 11. Referencias
+
+- [Configuración de un servidor DNS esclavo con BIND9 — Javier CD](https://www.javiercd.es/posts/servicios/dns/bind9/dns_esclavo/dns_esclavo/)
+- [Documentación oficial de BIND 9](https://bind9.readthedocs.io/)
